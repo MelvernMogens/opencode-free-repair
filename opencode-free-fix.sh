@@ -10,6 +10,9 @@
 # Repo:    https://github.com/MelvernMogens/opencode-free-repair
 set -euo pipefail
 
+# Capture the script's own directory BEFORE any cd (patch file lives next to it).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 REPO="${HERMES_REPO:-$HOME/.hermes/hermes-agent}"
 RELAY="https://opencode.ai/zen/v1"
 WORK="$(mktemp -d /tmp/ocfix.XXXXXX)"
@@ -211,19 +214,17 @@ say "backups → $BACKUP_DIR"
 #     tool aliasing, developer-role support) if present and not yet applied.
 PATCH_FILE=""
 for cand in "$SCRIPT_DIR/hermes-opencode-free.patch" \
-            "$(dirname "$SCRIPT_DIR")/hermes-opencode-free.patch" \
-            "$REPO/hermes-opencode-free.patch"; do
+            "$SCRIPT_DIR/../hermes-opencode-free.patch"; do
   [ -f "$cand" ] && PATCH_FILE="$cand" && break
 done
-if [ -n "$PATCH_FILE" ]; then
-  if git apply --check "$PATCH_FILE" 2>/dev/null; then
-    git apply "$PATCH_FILE" && say "structural patch applied from $(basename "$PATCH_FILE")"
-  else
-    say "structural patch not applicable (already applied or base changed) — skipping"
-  fi
+[ -n "$PATCH_FILE" ] || fail "hermes-opencode-free.patch not found next to script ($SCRIPT_DIR) — clone the full repo, don't run the script standalone"
+if git apply --check "$PATCH_FILE" 2>/dev/null; then
+  git apply "$PATCH_FILE" && say "structural patch applied from $(basename "$PATCH_FILE")"
+elif git apply --3way "$PATCH_FILE" >/dev/null 2>&1; then
+  say "structural patch applied via 3-way merge (base commit differed)"
+  git diff --name-only --diff-filter=U | sed 's/^/  CONFLICT: /' || true
 else
-  say "WARNING: hermes-opencode-free.patch not found next to this script;"
-  say "only the UA refresh below will run. Download the full repo for first-time installs."
+  say "structural patch not applicable (already applied or base changed) — skipping"
 fi
 if [ -n "$UA" ]; then
   /usr/bin/python3 - "$UA" "${FILES[@]}" <<'PYEOF'
