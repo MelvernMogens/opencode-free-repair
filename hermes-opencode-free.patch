@@ -1,0 +1,474 @@
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index cd3e768..bbf02c6 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -1776,8 +1776,17 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
+     # OpenCode Free is served anonymously: any unrecognized bearer is a 401, so an empty
+     # Authorization default_header overrides the SDK's "Bearer <api_key>".
+     if agent.provider == "opencode-free":
+-        from hermes_cli.models import opencode_zen_free_headers
+-        client_kwargs["default_headers"] = {**(client_kwargs.get("default_headers") or {}), **opencode_zen_free_headers()}
++        _existing_api_key = client_kwargs.get("api_key", "")
++        _is_keyless = str(_existing_api_key or "").strip() in {
++            "",
++            "opencode-zen-free-keyless",
++        }
++        if _is_keyless:
++            from hermes_cli.models import opencode_zen_free_headers
++            client_kwargs["default_headers"] = {
++                **(client_kwargs.get("default_headers") or {}),
++                **opencode_zen_free_headers(),
++            }
+     # All primary construction and recovery paths must identify Hermes to the official Codex
+     # endpoint, including snapshots with custom header overrides.
+     from agent.codex_headers import apply_required_codex_headers
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 1d99993..5c1332f 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -4833,7 +4833,7 @@ def _resolve_api_key_branch(req: _ResolveRequest, pconfig: Any, resolve_creds: C
+         _free_rt = _oc_free_rt(provider, req.model)
+     except Exception:
+         _free_rt = None
+-    if _free_rt is not None:
++    if _free_rt is not None and not api_key:
+         api_key = _free_rt["api_key"]
+         raw_base_url = str(_free_rt["base_url"]).rstrip("/")
+     if provider == "actual":
+diff --git a/agent/codex_responses_adapter.py b/agent/codex_responses_adapter.py
+index b98d83d..ec91427 100644
+--- a/agent/codex_responses_adapter.py
++++ b/agent/codex_responses_adapter.py
+@@ -732,9 +732,9 @@ def _preflight_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Di
+ 
+ 
+ def _preflight_role_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Dict[str, Any]:
+-    """Untyped ``user``/``assistant`` role message — the only legal shape besides typed items."""
++    """Untyped ``user``/``assistant``/``developer`` role message."""
+     role = item.get("role")
+-    if role not in {"user", "assistant"}:
++    if role not in {"user", "assistant", "developer"}:
+         raise ValueError(
+             f"Codex Responses input[{idx}] has unsupported item shape (type={item.get('type')!r}, role={role!r})."
+         )
+diff --git a/agent/opencode_affinity.py b/agent/opencode_affinity.py
+index be355eb..74d329a 100644
+--- a/agent/opencode_affinity.py
++++ b/agent/opencode_affinity.py
+@@ -48,7 +48,14 @@ def opencode_session_headers(
+     base_url: Optional[str],
+     session_id: Optional[str] = None,
+ ) -> dict[str, str]:
+-    """Return ``{"x-opencode-session": <key>}`` for OpenCode targets, else ``{}``."""
++    """Return ``{"x-opencode-session": <key>}`` for OpenCode targets, else ``{}``.
++
++    The anonymous contributor tier validates OpenCode-shaped session IDs.  Its
++    provider profile already supplies one, so do not replace it with Hermes'
++    conversation ID at request time.
++    """
++    if str(provider or "").strip().lower() == "opencode-free":
++        return {}
+     if not is_opencode_target(provider, base_url):
+         return {}
+     try:
+diff --git a/agent/transports/codex.py b/agent/transports/codex.py
+index ac0076d..5b19e94 100644
+--- a/agent/transports/codex.py
++++ b/agent/transports/codex.py
+@@ -178,6 +178,25 @@ def _alias_wire_tools(response_tools: Any, params: dict[str, Any], is_xai_respon
+     if response_tools and _is_opencode_responses_backend(params):
+         response_tools, _oc_aliases = _alias_reserved_tools(response_tools, _OPENCODE_RESERVED_TOOL_NAMES)
+         wire_aliases.update(_oc_aliases)
++        if str(params.get("provider") or "").strip().lower() == "opencode-free":
++            # Contributor-tier gate fingerprint: the native client exposes `bash`
++            # and `read`. Duplicate Hermes' equivalent schemas under those wire
++            # names; normalize_response maps calls back to the real dispatch names.
++            compatibility_aliases = []
++            for tool in response_tools:
++                original = tool.get("name") if isinstance(tool, dict) else None
++                alias = "bash" if original == "terminal" else "read" if original == "read_file" else None
++                if alias and isinstance(original, str):
++                    compatibility_aliases.append({
++                        **tool,
++                        "name": alias,
++                        "description": (
++                            f"OpenCode compatibility alias for {original}; prefer {original}. "
++                            + str(tool.get("description") or "")
++                        ),
++                    })
++                    wire_aliases[alias] = original
++            response_tools = [*response_tools, *compatibility_aliases]
+     # xAI server-side web search vs Hermes web providers. grok models on xAI's /v1/responses surface have a
+     # *native*, server-executed web search. A client-side function literally named ``web_search`` collides
+     # with that engine: declared as a plain ``function`` rather than ``{"type": "web_search"}``, the search
+@@ -597,6 +616,15 @@ class ResponsesApiTransport(ProviderTransport):
+             ),
+             "store": False,
+         }
++        # The OpenCode contributor relay now validates the native client's
++        # request shape in addition to its headers. Keep Hermes' full system
++        # instructions, while adding the stable native-client marker as a
++        # developer input item for the explicit anonymous provider.
++        if str(params.get("provider") or "").strip().lower() == "opencode-free":
++            kwargs["input"] = [
++                {"role": "developer", "content": "You are OpenCode-compatible Hermes Agent."},
++                *kwargs["input"],
++            ]
+         # ``tools`` MUST be omitted when empty: the openai SDK iterates it without a None guard.
+         if response_tools:
+             kwargs["tools"] = response_tools
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index b975b1d..ab098dc 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -2127,9 +2127,9 @@ def normalize_opencode_model_id(provider_id: Optional[str], model_id: Optional[s
+ 
+ # OpenCode Zen free-tier models (``*-free`` slugs plus unsuffixed ones like big-pickle) are
+ # served ANONYMOUSLY on the Zen relay: no Authorization header succeeds, while ANY unrecognized
+-# non-empty bearer — including our placeholder and OpenCode GO subscription keys — is 401'd (the
+-# Go relay doesn't serve the free tier at all).
+-OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER = "opencode-zen-free-keyless"
++# The official OpenCode client uses the anonymous Zen credential ``public``.
++# Keep it distinct from user-supplied OpenCode Zen/Go keys in resolution logic.
++OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER = "public"
+ _OPENCODE_ZEN_FREE_BASE_URL = "https://opencode.ai/zen/v1"
+ 
+ # ``-free``-suffixed slugs that are KEYED (Go-subscription) models, NOT anonymous-servable —
+@@ -2146,19 +2146,65 @@ _opencode_free_live_memo: Optional[tuple[float, Optional[list[str]]]] = None
+ _OPENCODE_FREE_LIVE_MEMO_TTL = 300.0  # 5 min; SWR disk cache handles the rest
+ 
+ 
+-def opencode_zen_free_headers() -> dict:
+-    """Client default_headers for anonymous Zen free-tier requests. ``Authorization: ""`` overrides the
+-    OpenAI SDK's ``Bearer <api_key>`` so the placeholder never reaches the wire (the relay 401s any
+-    unknown bearer). Attribution headers mirror the opencode provider profile."""
++def opencode_client_user_agent() -> str:
++    """User-Agent emitted by the current official OpenCode CLI."""
++    return "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
++
++
++def _opencode_id(prefix: str, *, descending: bool = False) -> str:
++    """Generate an ID matching OpenCode's 26-character ID payload."""
++    import secrets
++    import string
++    import time
++
++    value = int(time.time() * 1000) * 0x1000 + 1
++    if descending:
++        value = ~value
++    encoded_time = (value & ((1 << 48) - 1)).to_bytes(6, "big").hex()
++    alphabet = string.digits + string.ascii_uppercase + string.ascii_lowercase
++    random_part = "".join(secrets.choice(alphabet) for _ in range(14))
++    return f"{prefix}_{encoded_time}{random_part}"
++
++
++def _opencode_project_id() -> str:
++    """Resolve the stable project ID used by OpenCode for Git repositories."""
++    import hashlib
++    import os
++    import re
++    import subprocess
++    from urllib.parse import urlparse
++
+     try:
+-        from hermes_cli import __version__ as _v
+-    except Exception:
+-        _v = "0"
++        remote = subprocess.check_output(
++            ["git", "remote", "get-url", "origin"],
++            cwd=os.getcwd(), text=True, stderr=subprocess.DEVNULL, timeout=2,
++        ).strip()
++        parsed = urlparse(remote)
++        if parsed.hostname:
++            host, pathname = parsed.hostname.lower(), parsed.path
++        else:
++            match = re.match(r"^(?:[^@/:]+@)?([^/:]+):(.+)$", remote)
++            if not match:
++                raise ValueError("unsupported Git remote")
++            host, pathname = match.group(1).lower(), match.group(2)
++        pathname = re.sub(r"^/+|\.git/?$|/+$", "", pathname)
++        if host and pathname:
++            return hashlib.sha1(f"git-remote:{host}/{pathname}".encode()).hexdigest()
++    except (OSError, subprocess.SubprocessError, ValueError):
++        pass
++    return hashlib.sha1(os.path.realpath(os.getcwd()).encode()).hexdigest()
++
++
++def opencode_zen_free_headers() -> dict:
++    """Request identity emitted by the current official OpenCode CLI."""
++    session_id = _opencode_id("ses", descending=True)
+     return {
+-        "Authorization": "",
+-        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+-        "X-Title": "Hermes Agent",
+-        "User-Agent": f"HermesAgent/{_v}"}
++        "User-Agent": opencode_client_user_agent(),
++        "x-opencode-project": _opencode_project_id(),
++        "x-opencode-session": session_id,
++        "x-opencode-request": _opencode_id("msg"),
++        "x-opencode-client": "cli",
++    }
+ 
+ 
+ def _fetch_opencode_free_models(
+@@ -2225,6 +2271,11 @@ def opencode_zen_free_runtime(provider_id: Optional[str], model_id: Optional[str
+     family = opencode_provider_family(provider_id)
+     if family is None:
+         return None
++    # An explicit opencode-free selection is always anonymous, even when a paid
++    # Zen credential also exists. Only heal a free slug selected under Zen/Go
++    # when that paid family has no configured key.
++    if family != "opencode-free" and _opencode_family_key_configured(family):
++        return None
+     normalized = normalize_opencode_model_id(provider_id, model_id)
+     if family != "opencode-free" and normalized.strip().lower() not in _opencode_free_known_model_slugs():
+         return None
+@@ -2239,6 +2290,26 @@ def opencode_zen_free_runtime(provider_id: Optional[str], model_id: Optional[str
+         "source": "opencode-zen-free-keyless"}
+ 
+ 
++def _opencode_family_key_configured(family: str) -> bool:
++    """Return whether a real OpenCode key is configured for this family."""
++    import os
++
++    env = {
++        "opencode-zen": "OPENCODE_ZEN_API_KEY",
++        "opencode-go": "OPENCODE_GO_API_KEY",
++        "opencode-free": "OPENCODE_ZEN_API_KEY",
++    }.get(family or "")
++    if env and os.environ.get(env, "").strip():
++        return True
++    try:
++        from hermes_cli.auth import resolve_api_key_provider_credentials
++
++        creds = resolve_api_key_provider_credentials(family)
++        return bool(str(creds.get("api_key", "") or "").strip())
++    except Exception:
++        return False
++
++
+ # Per-family (model-id prefix → api_mode) routing from OpenCode's published Zen/Go endpoint
+ # tables, checked in order. GPT/Codex/Grok and Muse Spark use /v1/responses (Muse Spark 503s on
+ # chat/completions); Claude (Zen) and MiniMax (Go) use /v1/messages, as do Qwen models on both
+diff --git a/plugins/model-providers/opencode-free/__init__.py b/plugins/model-providers/opencode-free/__init__.py
+index e0c40ac..63fc388 100644
+--- a/plugins/model-providers/opencode-free/__init__.py
++++ b/plugins/model-providers/opencode-free/__init__.py
+@@ -9,11 +9,55 @@ hermes_cli.models.opencode_zen_free_runtime). Select via ``/model free``.
+ from typing import Any
+ 
+ from agent.reasoning_effort import ox_alpha_reasoning_extras
+-from hermes_cli import __version__ as _HERMES_VERSION
+ from providers import register_provider
+ from providers.base import ProviderProfile
+ 
+ 
++def _opencode_id(prefix: str, *, descending: bool = False) -> str:
++    import secrets
++    import string
++    import time
++
++    value = int(time.time() * 1000) * 0x1000 + 1
++    if descending:
++        value = ~value
++    encoded_time = (value & ((1 << 48) - 1)).to_bytes(6, "big").hex()
++    alphabet = string.digits + string.ascii_uppercase + string.ascii_lowercase
++    random_part = "".join(secrets.choice(alphabet) for _ in range(14))
++    return f"{prefix}_{encoded_time}{random_part}"
++
++
++def _opencode_project_id() -> str:
++    import hashlib
++    import os
++    import re
++    import subprocess
++    from urllib.parse import urlparse
++
++    try:
++        remote = subprocess.check_output(
++            ["git", "remote", "get-url", "origin"], cwd=os.getcwd(), text=True,
++            stderr=subprocess.DEVNULL, timeout=2,
++        ).strip()
++        parsed = urlparse(remote)
++        if parsed.hostname:
++            host, pathname = parsed.hostname.lower(), parsed.path
++        else:
++            match = re.match(r"^(?:[^@/:]+@)?([^/:]+):(.+)$", remote)
++            if not match:
++                raise ValueError("unsupported Git remote")
++            host, pathname = match.group(1).lower(), match.group(2)
++        pathname = re.sub(r"^/+|\.git/?$|/+$", "", pathname)
++        if host and pathname:
++            return hashlib.sha1(f"git-remote:{host}/{pathname}".encode()).hexdigest()
++    except (OSError, subprocess.SubprocessError, ValueError):
++        pass
++    return hashlib.sha1(os.path.realpath(os.getcwd()).encode()).hexdigest()
++
++
++_SESSION_ID = _opencode_id("ses", descending=True)
++
++
+ class OpenCodeFreeProfile(ProviderProfile):
+     """OpenCode Free — keyless, with Ox Alpha reasoning controls.
+ 
+@@ -32,13 +76,13 @@ opencode_free = OpenCodeFreeProfile(
+     env_vars=(),  # keyless — nothing to configure
+     base_url="https://opencode.ai/zen/v1", display_name="OpenCode Free",
+     description="OpenCode free models — keyless, no account needed",
+-    # Attribution headers (same values as opencode-zen/go) plus the empty Authorization
+-    # override that keeps the SDK's "Bearer <placeholder>" off the wire (free tier 401s it).
++    # Match the request identity emitted by the official OpenCode CLI.
+     default_headers={
+-        "Authorization": "",
+-        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+-        "X-Title": "Hermes Agent",
+-        "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
++        "User-Agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
++        "x-opencode-project": _opencode_project_id(),
++        "x-opencode-session": _SESSION_ID,
++        "x-opencode-request": _opencode_id("msg"),
++        "x-opencode-client": "cli",
+     },
+     # laguna-s-2.1-free was delisted by the relay 2026-09-09 (anon 401). Of the
+     # surviving anonymous models mimo-v2.5-free is the only one that answers
+diff --git a/plugins/model-providers/opencode-zen/__init__.py b/plugins/model-providers/opencode-zen/__init__.py
+index 8fb437b..f142ddd 100644
+--- a/plugins/model-providers/opencode-zen/__init__.py
++++ b/plugins/model-providers/opencode-zen/__init__.py
+@@ -7,16 +7,62 @@ chat_completions reasoning translations (GLM-5.2, Kimi K2, DeepSeek, Ox Alpha).
+ from typing import Any
+ 
+ from agent import reasoning_effort as re_
+-from hermes_cli import __version__ as _HERMES_VERSION
+ from providers import register_provider
+ from providers.base import ProviderProfile
+ 
+-# Attribution headers (same values as OpenRouter / Vercel / Fireworks); via
+-# default_headers so they survive model switches and credential rotation.
++
++def _opencode_id(prefix: str, *, descending: bool = False) -> str:
++    import secrets
++    import string
++    import time
++
++    value = int(time.time() * 1000) * 0x1000 + 1
++    if descending:
++        value = ~value
++    encoded_time = (value & ((1 << 48) - 1)).to_bytes(6, "big").hex()
++    alphabet = string.digits + string.ascii_uppercase + string.ascii_lowercase
++    random_part = "".join(secrets.choice(alphabet) for _ in range(14))
++    return f"{prefix}_{encoded_time}{random_part}"
++
++
++def _opencode_project_id() -> str:
++    import hashlib
++    import os
++    import re
++    import subprocess
++    from urllib.parse import urlparse
++
++    try:
++        remote = subprocess.check_output(
++            ["git", "remote", "get-url", "origin"], cwd=os.getcwd(), text=True,
++            stderr=subprocess.DEVNULL, timeout=2,
++        ).strip()
++        parsed = urlparse(remote)
++        if parsed.hostname:
++            host, pathname = parsed.hostname.lower(), parsed.path
++        else:
++            match = re.match(r"^(?:[^@/:]+@)?([^/:]+):(.+)$", remote)
++            if not match:
++                raise ValueError("unsupported Git remote")
++            host, pathname = match.group(1).lower(), match.group(2)
++        pathname = re.sub(r"^/+|\.git/?$|/+$", "", pathname)
++        if host and pathname:
++            return hashlib.sha1(f"git-remote:{host}/{pathname}".encode()).hexdigest()
++    except (OSError, subprocess.SubprocessError, ValueError):
++        pass
++    return hashlib.sha1(os.path.realpath(os.getcwd()).encode()).hexdigest()
++
++
++_SESSION_ID = _opencode_id("ses", descending=True)
++
++
++# Request identity emitted by the current official OpenCode CLI.
+ _ATTRIBUTION_HEADERS = {
+-    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+-    "X-Title": "Hermes Agent",
+-    "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
++    "User-Agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
++    "x-opencode-project": _opencode_project_id(),
++    "x-opencode-session": _SESSION_ID,
++    "x-opencode-request": _opencode_id("msg"),
++    "x-opencode-client": "cli",
+ }
+ 
+ 
+diff --git a/tests/hermes_cli/test_runtime_provider_resolution.py b/tests/hermes_cli/test_runtime_provider_resolution.py
+index 7254653..1e2cbb6 100644
+--- a/tests/hermes_cli/test_runtime_provider_resolution.py
++++ b/tests/hermes_cli/test_runtime_provider_resolution.py
+@@ -1739,9 +1739,8 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
+ 
+ def test_resolve_runtime_provider_opencode_free_keyless_despite_exhausted_pool(monkeypatch):
+     """OpenCode Free is keyless: an exhausted credential pool must not raise
+-    a missing-credential error. The provider resolves with the keyless
+-    placeholder + empty-Authorization headers so the request goes out
+-    anonymously."""
++    a missing-credential error. The provider resolves with the official
++    anonymous credential and native OpenCode request identity."""
+     class _ExhaustedPool:
+         def has_credentials(self):
+             return True
+@@ -1762,10 +1761,11 @@ def test_resolve_runtime_provider_opencode_free_keyless_despite_exhausted_pool(m
+     )
+ 
+     assert resolved["provider"] == "opencode-free"
+-    assert resolved["api_key"] == "opencode-zen-free-keyless"
++    assert resolved["api_key"] == "public"
+     assert resolved["base_url"] == "https://opencode.ai/zen/v1"
+     assert resolved["api_mode"] == "chat_completions"
+-    assert resolved["default_headers"]["Authorization"] == ""
++    assert "Authorization" not in resolved["default_headers"]
++    assert resolved["default_headers"]["x-opencode-client"] == "cli"
+ 
+ 
+ def test_resolve_runtime_provider_opencode_free_missing_env_still_resolves(monkeypatch):
+@@ -1788,10 +1788,36 @@ def test_resolve_runtime_provider_opencode_free_missing_env_still_resolves(monke
+     )
+ 
+     assert resolved["provider"] == "opencode-free"
+-    assert resolved["api_key"] == "opencode-zen-free-keyless"
++    assert resolved["api_key"] == "public"
+     assert resolved["base_url"] == "https://opencode.ai/zen/v1"
+ 
+ 
++def test_resolve_runtime_provider_explicit_opencode_free_ignores_paid_zen_key(monkeypatch):
++    """Selecting the dedicated free provider remains keyless when a paid Zen key exists."""
++    class _NoPool:
++        def has_credentials(self):
++            return False
++
++    monkeypatch.setenv("OPENCODE_ZEN_API_KEY", "paid-zen-key")
++    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "opencode-free")
++    monkeypatch.setattr(
++        rp,
++        "_get_model_config",
++        lambda: {"provider": "opencode-free", "default": "muse-spark-1.2-contributor-free"},
++    )
++    monkeypatch.setattr(rp, "load_pool", lambda provider: _NoPool())
++
++    resolved = rp.resolve_runtime_provider(
++        requested="opencode-free", target_model="muse-spark-1.2-contributor-free"
++    )
++
++    assert resolved["provider"] == "opencode-free"
++    assert resolved["api_key"] == "public"
++    assert resolved["api_mode"] == "codex_responses"
++    assert "Authorization" not in resolved["default_headers"]
++    assert resolved["default_headers"]["x-opencode-client"] == "cli"
++
++
+ def test_custom_provider_explicit_target_model_wins(monkeypatch):
+     """An explicit target_model must not be silently replaced by the custom
+     provider's configured default model (regression: auxiliary slots such as

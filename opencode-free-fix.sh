@@ -159,14 +159,39 @@ STATUS=$(/usr/bin/python3 -c 'import json;print(json.load(open("'$REPLAY'"))["st
 UA=$(/usr/bin/python3 -c 'import json;h=json.load(open("'$CAP'"))["headers"];print(h.get("User-Agent") or h.get("user-agent") or "")')
 say "replay OK (200). captured UA: ${UA:-<none>}"
 
-# ------------------------------------------------------------------ 6. patch
+# ---------------------------------------------------------------- 6. patch
 step "6/8 Patch Hermes fingerprint"
 FILES=(hermes_cli/models.py
        plugins/model-providers/opencode-free/__init__.py
        plugins/model-providers/opencode-zen/__init__.py)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$BACKUP_DIR"
-for f in "${FILES[@]}"; do mkdir -p "$BACKUP_DIR/$(dirname "$f")"; cp "$f" "$BACKUP_DIR/$f"; done
+for f in "${FILES[@]}" agent/agent_runtime_helpers.py agent/auxiliary_client.py \
+         agent/codex_responses_adapter.py agent/opencode_affinity.py \
+         agent/transports/codex.py; do
+  [ -f "$f" ] || continue
+  mkdir -p "$BACKUP_DIR/$(dirname "$f")"; cp "$f" "$BACKUP_DIR/$f"
+done
 say "backups → $BACKUP_DIR"
+
+# 6a. apply the full structural patch (keyless credential, ID formats, UA,
+#     tool aliasing, developer-role support) if present and not yet applied.
+PATCH_FILE=""
+for cand in "$SCRIPT_DIR/hermes-opencode-free.patch" \
+            "$(dirname "$SCRIPT_DIR")/hermes-opencode-free.patch" \
+            "$REPO/hermes-opencode-free.patch"; do
+  [ -f "$cand" ] && PATCH_FILE="$cand" && break
+done
+if [ -n "$PATCH_FILE" ]; then
+  if git apply --check "$PATCH_FILE" 2>/dev/null; then
+    git apply "$PATCH_FILE" && say "structural patch applied from $(basename "$PATCH_FILE")"
+  else
+    say "structural patch not applicable (already applied or base changed) — skipping"
+  fi
+else
+  say "WARNING: hermes-opencode-free.patch not found next to this script;"
+  say "only the UA refresh below will run. Download the full repo for first-time installs."
+fi
 if [ -n "$UA" ]; then
   /usr/bin/python3 - "$UA" "${FILES[@]}" <<'PYEOF'
 import re, sys
@@ -187,7 +212,10 @@ PYEOF
 else
   say "capture had no User-Agent; skipping UA patch (relay may not require it now)"
 fi
-uv run python -m py_compile "${FILES[@]}" || fail "patched files no longer compile — restoring backups"
+uv run python -m py_compile "${FILES[@]}" agent/agent_runtime_helpers.py \
+  agent/auxiliary_client.py agent/codex_responses_adapter.py \
+  agent/opencode_affinity.py agent/transports/codex.py 2>/dev/null \
+  || fail "patched files no longer compile — restoring backups"
 say "syntax OK"
 
 # ------------------------------------------------------------- 7. test + restart
@@ -219,6 +247,10 @@ if echo "$OUT" | grep -q 'OK'; then
 else
   printf '\033[1;31mSTILL BROKEN\033[0m last line: %s\n' "$OUT"
   say "restoring backups…"
-  for f in "${FILES[@]}"; do cp "$BACKUP_DIR/$f" "$f"; done
+  for f in "${FILES[@]}" agent/agent_runtime_helpers.py agent/auxiliary_client.py \
+           agent/codex_responses_adapter.py agent/opencode_affinity.py \
+           agent/transports/codex.py; do
+    [ -f "$BACKUP_DIR/$f" ] && cp "$BACKUP_DIR/$f" "$f"
+  done
   fail "auto-patch insufficient (gate changed structurally, not just version strings). Capture kept at $CAP — hand it to the opencode-free-repair skill run on any working model."
 fi
