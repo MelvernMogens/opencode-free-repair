@@ -58,7 +58,6 @@ except Exception: pass' || true)
 }
 MODEL="$(detect_model)"
 say "target model: $MODEL"
-seed_consent
 
 # Run a command with a hard timeout (macOS has no `timeout`).
 run_timed() { # run_timed <secs> <cmd...>
@@ -99,8 +98,10 @@ if run_probe && run_timed 180 "$HERMES" -z 'Reply exactly OK' --provider opencod
 fi
 say "confirmed broken (or --force refresh requested)"
 
-# ------------------------------------------------- 3. download official client
-step "3/8 Fetch official OpenCode client"
+seed_consent
+
+# ----------------------------------------------------- 3. official client
+step "3/8 Download official OpenCode client"
 OC_BIN="$WORK/bin/opencode"
 if [ -n "${OPENCODE_BIN:-}" ] && [ -x "${OPENCODE_BIN:-}" ]; then
   OC_BIN="$OPENCODE_BIN"; say "using OPENCODE_BIN=$OC_BIN"
