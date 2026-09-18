@@ -59,9 +59,22 @@ except Exception: pass' || true)
 MODEL="$(detect_model)"
 say "target model: $MODEL"
 
-run_probe() { "$HERMES" -z 'Reply exactly OK' --provider opencode-free --model "$MODEL" \
-              >/dev/null 2>&1 || true; }
-if run_probe && "$HERMES" -z 'Reply exactly OK' --provider opencode-free \
+# Run a command with a hard timeout (macOS has no `timeout`).
+run_timed() { # run_timed <secs> <cmd...>
+  local secs=$1; shift
+  "$@" & local pid=$!
+  ( sleep "$secs"; kill "$pid" 2>/dev/null || true ) & local wd=$!
+  wait "$pid" 2>/dev/null; local rc=$?
+  kill "$wd" 2>/dev/null || true
+  return $rc
+}
+
+run_probe() {
+  say "probing provider (up to 3 min — first run builds the venv)…"
+  run_timed 180 "$HERMES" -z 'Reply exactly OK' --provider opencode-free \
+    --model "$MODEL" >/dev/null 2>&1 || true
+}
+if run_probe && run_timed 180 "$HERMES" -z 'Reply exactly OK' --provider opencode-free \
      --model "$MODEL" 2>/dev/null | tail -1 | grep -qx 'OK'; then
   say "provider already works"
   [ "$FORCE" = 1 ] || { say "nothing to do (--force to refresh fingerprint anyway)"; exit 0; }
@@ -240,7 +253,8 @@ fi
 
 # ---------------------------------------------------------------- 8. verify
 step "8/8 Verify end-to-end"
-OUT=$("$HERMES" -z 'Reply exactly OK' --provider opencode-free --model "$MODEL" 2>&1 | tail -1 || true)
+OUT=$(run_timed 180 "$HERMES" -z 'Reply exactly OK' --provider opencode-free \
+      --model "$MODEL" 2>&1 | tail -1 || true)
 if echo "$OUT" | grep -q 'OK'; then
   printf '\n\033[1;32mFIXED\033[0m — %s answered "OK" through the full Hermes stack.\n' "$MODEL"
   exit 0
