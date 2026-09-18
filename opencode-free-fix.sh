@@ -85,6 +85,7 @@ seed_consent() {
   fi
   say "seeded data-training consent in ~/.hermes/config.yaml (backup: config.yaml.ocfix-bak)"
 }
+seed_consent
 
 run_probe() {
   say "probing provider (up to 3 min — first run builds the venv)…"
