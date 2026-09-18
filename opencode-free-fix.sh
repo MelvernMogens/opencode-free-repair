@@ -200,7 +200,6 @@ step "6/8 Patch Hermes fingerprint"
 FILES=(hermes_cli/models.py
        plugins/model-providers/opencode-free/__init__.py
        plugins/model-providers/opencode-zen/__init__.py)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$BACKUP_DIR"
 for f in "${FILES[@]}" agent/agent_runtime_helpers.py agent/auxiliary_client.py \
          agent/codex_responses_adapter.py agent/opencode_affinity.py \
