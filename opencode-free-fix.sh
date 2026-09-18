@@ -32,7 +32,13 @@ step() { printf '\n\033[1;35m== %s ==\033[0m\n' "$*"; }
 step "1/8 Precheck"
 [ -d "$REPO" ] || fail "Hermes repo not found at $REPO (set HERMES_REPO)"
 cd "$REPO"
-command -v uv >/dev/null || fail "uv not installed"
+if ! command -v uv >/dev/null; then
+  say "uv not installed — installing via official installer…"
+  curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 || fail "could not install uv"
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v uv >/dev/null || fail "uv installed but not on PATH — rerun this script in a new terminal"
+  say "uv installed: $(uv --version 2>/dev/null || echo ok)"
+fi
 HERMES="./venv/bin/hermes"; [ -x "$HERMES" ] || fail "$HERMES missing"
 
 # ---------------------------------------------------------------- 2. reproduce
