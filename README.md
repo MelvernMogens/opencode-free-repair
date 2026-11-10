@@ -44,3 +44,5 @@ cd ~/.hermes/hermes-agent
 
 - Hermes Agent checkout at `~/.hermes/hermes-agent` with `uv`
 - Read the full procedure in [`SKILL.md`](SKILL.md) — it is the source of truth
+
+Built by [Melvern Mogens](https://github.com/MelvernMogens).
